@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Raumklima DHT11</title>
+<style>
+:root{color-scheme:light dark;
+  --bg:light-dark(#f6f7f9,#0f1216);--card:light-dark(#ffffff,#181d24);
+  --ink:light-dark(#14171c,#eef1f5);--muted:light-dark(#5d6672,#9aa4b1);
+  --line:light-dark(#e2e6ec,#2a313b);--temp:#e0573a;--hum:#2f7fd6;--accent:#0b6e63}
+*{box-sizing:border-box;min-width:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 -apple-system,system-ui,sans-serif;
+  padding:max(16px,env(safe-area-inset-top)) 16px 40px}
+main{max-width:760px;margin:0 auto}
+h1{font-size:26px;margin:4px 0 2px;font-weight:650}
+.status{color:var(--muted);font-size:14px;display:flex;align-items:center;gap:8px;min-height:22px}
+.dot{width:10px;height:10px;border-radius:50%;background:#9aa4b1;flex:none}
+.dot.on{background:#2fa36b}.dot.busy{background:#e0a23a}
+button{font:inherit;border:0;border-radius:12px;padding:12px 16px;min-height:44px;cursor:pointer}
+.primary{background:var(--accent);color:#fff;font-weight:600;width:100%;margin:14px 0}
+.ghost{background:var(--card);color:var(--ink);border:1px solid var(--line)}
+.danger{color:#c0392b}
+.now{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}
+.label{color:var(--muted);font-size:14px}
+.big{font-size:clamp(34px,10vw,52px);font-weight:700;line-height:1.1;white-space:nowrap}
+.t .big{color:var(--temp)}.h .big{color:var(--hum)}
+.mm{font-size:13px;color:var(--muted);margin-top:4px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin:20px 0 12px}
+.chips button{background:var(--card);border:1px solid var(--line);color:var(--ink);padding:8px 14px;min-height:40px;border-radius:999px}
+.chips button.active{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.chart{position:relative;height:240px;margin-bottom:12px}
+.chart canvas{position:absolute;inset:16px;width:calc(100% - 32px)!important;height:calc(100% - 32px)!important}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+.row button{flex:1 1 140px}
+.hint{font-size:13px;color:var(--muted);margin-top:16px}
+.warn{background:light-dark(#fff4e0,#3a2c12);border:1px solid light-dark(#f0d29a,#6b5320);border-radius:12px;padding:12px;font-size:14px;margin-top:12px}
+textarea{width:100%;height:140px;margin-top:10px;font:12px ui-monospace,monospace;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink);padding:8px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <h1>Raumklima</h1>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">Nicht verbunden</span></div>
+  <div class="warn" id="noBt" hidden>Dieser Browser kann kein Bluetooth. Öffne die Seite auf dem iPhone in der App <b>Bluefy</b> (kostenlos im App Store).</div>
+
+  <button class="primary" id="connect">Mit Sensor verbinden</button>
+
+  <section class="now">
+    <div class="card t"><div class="label">Temperatur</div><div class="big" id="tNow">–</div><div class="mm" id="tMM"></div></div>
+    <div class="card h"><div class="label">Luftfeuchtigkeit</div><div class="big" id="hNow">–</div><div class="mm" id="hMM"></div></div>
+  </section>
+
+  <div class="chips" id="chips">
+    <button data-h="6">6 Std.</button>
+    <button data-h="24" class="active">24 Std.</button>
+    <button data-h="168">7 Tage</button>
+    <button data-h="720">30 Tage</button>
+    <button data-h="0">Alles</button>
+  </div>
+
+  <div class="card chart"><canvas id="cT"></canvas></div>
+  <div class="card chart"><canvas id="cH"></canvas></div>
+
+  <div class="row">
+    <button class="ghost" id="csv">Als CSV exportieren</button>
+    <button class="ghost danger" id="del">Alle Daten löschen</button>
+  </div>
+  <textarea id="csvBox" hidden readonly></textarea>
+  <p class="hint" id="info"></p>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+{
+const SVC = '6e1f0000-3b5a-4c2e-9d7a-5f2b8c1d0a01';
+const C_AKT = '6e1f0001-3b5a-4c2e-9d7a-5f2b8c1d0a01';
+const C_STEUER = '6e1f0002-3b5a-4c2e-9d7a-5f2b8c1d0a01';
+const C_VERLAUF = '6e1f0003-3b5a-4c2e-9d7a-5f2b8c1d0a01';
+const KEIN_WERT = -32768;
+const MAX_TAGE = 90;               // ältere Daten werden verworfen
+const KEY = 'dht11_daten_v1';
+
+const $ = id => document.getElementById(id);
+let device = null, chAkt, chSteuer, chVerlauf, syncTimer = null, syncing = false;
+let rangeH = 24, delArmed = false;
+
+// ---------- Speicher (auf dem Handy) ----------
+// daten: [[zeit_in_minuten, t10, h10], ...] sortiert; boots: {bootId: letzteNr}
+let store = { daten: [], boots: {} };
+try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.daten) store = s; } catch (e) {}
+function save() {
+  const grenze = Date.now() / 60000 - MAX_TAGE * 1440;
+  store.daten = store.daten.filter(d => d[0] >= grenze);
+  try { localStorage.setItem(KEY, JSON.stringify(store)); }
+  catch (e) { setStatus('Speichern fehlgeschlagen – Speicher voll?', ''); }
+}
+
+// ---------- Anzeige ----------
+function setStatus(text, cls) { $('status').textContent = text; $('dot').className = 'dot ' + (cls || ''); }
+const fmt = (v, d) => v.toLocaleString('de-DE', { minimumFractionDigits: d, maximumFractionDigits: d });
+
+function mkChart(canvas, color, unit, dec) {
+  return new Chart(canvas, {
+    type: 'line',
+    data: { datasets: [{ data: [], borderColor: color, backgroundColor: color + '22', fill: true,
+      borderWidth: 2, pointRadius: 0, tension: 0.25, spanGaps: false }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false, parsing: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { display: false },
+        title: { display: true, text: unit === '°C' ? 'Temperatur (°C)' : 'Luftfeuchtigkeit (%)', align: 'start', color: getComputedStyle(document.body).color },
+        tooltip: { callbacks: {
+          title: it => new Date(it[0].parsed.x).toLocaleString('de-DE', { weekday: 'short', hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' }),
+          label: it => fmt(it.parsed.y, dec) + ' ' + unit } } },
+      scales: {
+        x: { type: 'linear', ticks: { maxTicksLimit: 6, color: '#8a94a1', callback: v => zeitLabel(v) }, grid: { display: false } },
+        y: { ticks: { color: '#8a94a1', maxTicksLimit: 6 }, grid: { color: 'rgba(128,128,128,.15)' } }
+      }
+    }
+  });
+}
+function zeitLabel(ms) {
+  const d = new Date(ms);
+  if (rangeH && rangeH <= 24) return d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+  return d.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit' });
+}
+const chartT = window.Chart ? mkChart($('cT'), '#e0573a', '°C', 1) : null;
+const chartH = window.Chart ? mkChart($('cH'), '#2f7fd6', '%', 0) : null;
+
+function render() {
+  const jetztMin = Date.now() / 60000;
+  const sicht = store.daten.filter(d => !rangeH || d[0] >= jetztMin - rangeH * 60);
+  const pt = [], ph = [];
+  let tMin = Infinity, tMax = -Infinity, hMin = Infinity, hMax = -Infinity, prev = null;
+  for (const [m, t10, h10] of sicht) {
+    if (prev !== null && m - prev > 3) { pt.push({ x: (prev + 1) * 60000, y: null }); ph.push({ x: (prev + 1) * 60000, y: null }); }
+    prev = m;
+    if (t10 === KEIN_WERT) continue;
+    const t = t10 / 10, h = h10 / 10;
+    pt.push({ x: m * 60000, y: t }); ph.push({ x: m * 60000, y: h });
+    tMin = Math.min(tMin, t); tMax = Math.max(tMax, t); hMin = Math.min(hMin, h); hMax = Math.max(hMax, h);
+  }
+  if (chartT) {
+    chartT.data.datasets[0].data = pt; chartH.data.datasets[0].data = ph;
+    chartT.update(); chartH.update();
+  }
+  $('tMM').textContent = isFinite(tMin) ? `Min ${fmt(tMin, 1)} · Max ${fmt(tMax, 1)} °C` : 'Noch keine Daten';
+  $('hMM').textContent = isFinite(hMin) ? `Min ${fmt(hMin, 0)} · Max ${fmt(hMax, 0)} %` : 'Noch keine Daten';
+  const alle = store.daten.length;
+  $('info').textContent = alle
+    ? `${alle.toLocaleString('de-DE')} Messwerte gespeichert, ältester vom ${new Date(store.daten[0][0] * 60000).toLocaleString('de-DE')}. Daten älter als ${MAX_TAGE} Tage werden automatisch gelöscht.`
+    : 'Noch keine Messwerte gespeichert. Verbinde dich mit dem Sensor.';
+}
+
+// ---------- Bluetooth ----------
+function parsePaket(dv) {
+  const k = { boot: dv.getUint16(0, true), intervall: dv.getUint16(2, true), seit: dv.getUint16(4, true),
+    neueste: dv.getUint32(6, true), anzahl: dv.getUint16(10, true), start: dv.getUint16(12, true), n: dv.getUint8(14) };
+  k.werte = [];
+  for (let j = 0; j < k.n && 16 + j * 4 + 3 < dv.byteLength; j++) {
+    k.werte.push([dv.getInt16(16 + j * 4, true), dv.getInt16(18 + j * 4, true)]);
+  }
+  return k;
+}
+async function holePaket(start) {
+  const b = new Uint8Array([start & 0xff, start >> 8]);
+  if (chSteuer.writeValueWithResponse) await chSteuer.writeValueWithResponse(b);
+  else await chSteuer.writeValue(b);
+  const dv = await chVerlauf.readValue();
+  return { ...parsePaket(dv), gelesen: Date.now() };
+}
+
+async function sync() {
+  if (syncing || !device || !device.gatt.connected) return;
+  syncing = true;
+  try {
+    let p = await holePaket(0xffff);                       // nur Kopf
+    if (p.anzahl === 0) { setStatus('Verbunden – Arduino sammelt noch (1 Wert pro Minute)', 'on'); return; }
+    const letzte = store.boots[p.boot] || 0;
+    let gewuenscht = Math.max(letzte + 1, p.neueste - p.anzahl + 1);
+    const neu = [];
+    while (gewuenscht <= p.neueste) {
+      const aelteste = p.neueste - p.anzahl + 1;
+      const start = Math.max(0, gewuenscht - aelteste);
+      setStatus(`Lade Verlauf … ${neu.length} neue Werte`, 'busy');
+      p = await holePaket(start);
+      if (p.n === 0) break;
+      const aeltNr = p.neueste - p.anzahl + 1;
+      p.werte.forEach(([t10, h10], j) => {
+        const i = p.start + j, nr = aeltNr + i;
+        if (nr < gewuenscht) return;
+        const ms = p.gelesen - p.seit * 1000 - (p.anzahl - 1 - i) * p.intervall * 1000;
+        neu.push([Math.round(ms / 60000), t10, h10]);
+        gewuenscht = nr + 1;
+      });
+    }
+    store.boots[p.boot] = gewuenscht - 1;
+    if (neu.length) {
+      store.daten = store.daten.concat(neu).sort((a, b) => a[0] - b[0]);
+      save(); render();
+    } else save();
+    setStatus(`Verbunden · ${neu.length} neue Werte geladen · ${new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}`, 'on');
+  } catch (e) {
+    setStatus('Fehler beim Laden: ' + e.message, '');
+  } finally { syncing = false; }
+}
+
+function aktuellGeaendert(e) {
+  const dv = e.target.value;
+  if (dv.byteLength < 4) return;
+  $('tNow').textContent = fmt(dv.getInt16(0, true) / 10, 1) + ' °C';
+  $('hNow').textContent = fmt(dv.getInt16(2, true) / 10, 0) + ' %';
+}
+
+async function verbinden() {
+  try {
+    if (!device) {
+      device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }, { name: 'DHT11-Sensor' }], optionalServices: [SVC] });
+      device.addEventListener('gattserverdisconnected', () => {
+        clearInterval(syncTimer);
+        setStatus('Verbindung getrennt', '');
+        $('connect').textContent = 'Erneut verbinden'; $('connect').hidden = false;
+      });
+    }
+    setStatus('Verbinde …', 'busy');
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    chAkt = await svc.getCharacteristic(C_AKT);
+    chSteuer = await svc.getCharacteristic(C_STEUER);
+    chVerlauf = await svc.getCharacteristic(C_VERLAUF);
+    chAkt.addEventListener('characteristicvaluechanged', aktuellGeaendert);
+    await chAkt.startNotifications();
+    aktuellGeaendert({ target: { value: await chAkt.readValue() } });
+    $('connect').hidden = true;
+    await sync();
+    clearInterval(syncTimer);
+    syncTimer = setInterval(sync, 60000);                  // jede Minute nachladen
+  } catch (e) {
+    if (e.name !== 'NotFoundError') setStatus('Verbindung fehlgeschlagen: ' + e.message, '');
+    else setStatus('Kein Gerät ausgewählt', '');
+  }
+}
+
+// ---------- Bedienung ----------
+if (!navigator.bluetooth) { $('noBt').hidden = false; $('connect').disabled = true; }
+$('connect').addEventListener('click', verbinden);
+$('chips').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  rangeH = +b.dataset.h;
+  for (const x of $('chips').children) x.classList.toggle('active', x === b);
+  render();
+});
+$('csv').addEventListener('click', () => {
+  const zeilen = ['Zeit;Temperatur_C;Luftfeuchte_Prozent'].concat(store.daten
+    .filter(d => d[1] !== KEIN_WERT)
+    .map(([m, t, h]) => `${new Date(m * 60000).toLocaleString('de-DE')};${fmt(t / 10, 1)};${fmt(h / 10, 0)}`));
+  const text = zeilen.join('\n');
+  try {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+    a.download = 'raumklima.csv'; a.click();
+  } catch (e) {}
+  $('csvBox').value = text; $('csvBox').hidden = false;   // Fallback: zum Kopieren anzeigen
+});
+$('del').addEventListener('click', () => {
+  if (!delArmed) { delArmed = true; $('del').textContent = 'Wirklich löschen? Nochmal tippen'; setTimeout(() => { delArmed = false; $('del').textContent = 'Alle Daten löschen'; }, 4000); return; }
+  store = { daten: [], boots: {} }; save(); render();
+  delArmed = false; $('del').textContent = 'Alle Daten löschen';
+});
+
+if (!window.Chart) $('info').textContent = 'Diagramm-Bibliothek konnte nicht geladen werden – Internetverbindung prüfen.';
+render();
+}
+</script>
+</body>
+</html>
